@@ -37,7 +37,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * {@code FeatureOption.isExpRegion()} 临时返回 true，保住 AOSP 的 Alerting/Silent/Minimized 分区；
  * 再往渲染树里补回国内分支漏掉的静音表头 node。</p>
  *
- * <p>功能二：剪贴板弹窗 —— {@code ClipboardListener#onPrimaryClipChanged} 开头的国内判断放行。</p>
+ * <p>功能二：剪贴板弹窗 —— ColorOS 15+ 在 {@code ClipboardListener#start} 中阻断注册，旧版在 {@code onPrimaryClipChanged} 中阻断；本模块在两处均放行 {@code FeatureOption.isExpRegion()}，并由 {@code shouldSuppressOverlay} 与动态注册管理实现无感适配与开关控制。</p>
  */
 public final class HookCore {
 
@@ -71,6 +71,10 @@ public final class HookCore {
     private static volatile boolean clipboardEnabled = true;
     private static volatile Object silentHeaderController = null;
     private static volatile Class<?> nodeSpecImplClass = null;
+
+    /** 记录系统 UI 中运行的 ClipboardListener 实例及监听器注册状态，用于热生效与动态开关 */
+    private static volatile Object clipboardListenerInstance = null;
+    private static volatile boolean clipboardListenerRegistered = false;
 
     /**
      * NodeSpecImpl 的 {@code (NodeSpec, NodeController)} 构造器，安装时用宿主类加载器解析一次。
@@ -185,6 +189,7 @@ public final class HookCore {
                     return;
                 }
                 notifEnabled = intent.getBooleanExtra(MainActivity.KEY_NOTIF, notifEnabled);
+                boolean oldClip = clipboardEnabled;
                 clipboardEnabled = intent.getBooleanExtra(MainActivity.KEY_CLIP, clipboardEnabled);
                 ctx.getSharedPreferences(CACHE_PREFS, Context.MODE_PRIVATE).edit()
                         .putBoolean(MainActivity.KEY_NOTIF, notifEnabled)
@@ -192,6 +197,9 @@ public final class HookCore {
                         .apply();
                 api.log(TAG + ": settings updated (notif=" + notifEnabled
                         + ", clipboard=" + clipboardEnabled + ")");
+                if (oldClip != clipboardEnabled) {
+                    updateClipboardListenerState();
+                }
             }
         };
         IntentFilter filter = new IntentFilter(MainActivity.ACTION_SETTINGS);
@@ -386,10 +394,25 @@ public final class HookCore {
 
     private static void hookClipboardListener(ClassLoader cl) throws Throwable {
         Class<?> listener = cl.loadClass(CLS_CLIPBOARD_LISTENER);
-        api.hookMethod(listener, "onPrimaryClipChanged", new Class<?>[0], new HookApi.Around() {
+
+        // 挂钩构造函数，保存实例对象供热更新使用
+        api.hookAllMethods(listener, "<init>", new HookApi.Around() {
             @Override
             public void before(Object thisObject, Object[] args) {
-                // 国内分支开头会因为 isExpRegion()==false 直接 return，这里放开它
+            }
+
+            @Override
+            public Object after(Object thisObject, Object[] args, Object result) {
+                clipboardListenerInstance = thisObject;
+                return result;
+            }
+        });
+
+        HookApi.Around regionAround = new HookApi.Around() {
+            @Override
+            public void before(Object thisObject, Object[] args) {
+                clipboardListenerInstance = thisObject;
+                // 国内分支在 start()（ColorOS 15+）或 onPrimaryClipChanged()（旧版）会因为 isExpRegion()==false 直接 return，这里放开它
                 if (clipboardEnabled) {
                     IN_CLIPBOARD_LISTENER.set(Boolean.TRUE);
                 }
@@ -398,9 +421,90 @@ public final class HookCore {
             @Override
             public Object after(Object thisObject, Object[] args, Object result) {
                 IN_CLIPBOARD_LISTENER.set(Boolean.FALSE);
+                if (clipboardEnabled) {
+                    clipboardListenerRegistered = true;
+                }
                 return result;
             }
-        });
+        };
+
+        // ColorOS 15 及以上：OPPO 把国内区域限制放到了 start() 方法中
+        // 在 start() 执行期间让 isExpRegion() 返回 true，使 addPrimaryClipChangedListener 顺利执行
+        try {
+            api.hookMethod(listener, "start", new Class<?>[0], regionAround);
+            api.log(TAG + ": hooked ClipboardListener#start");
+        } catch (Throwable t) {
+            logFailure("hook ClipboardListener#start", t);
+        }
+
+        // ColorOS 14 及旧版：国内区域限制在 onPrimaryClipChanged() 开头，保留挂钩保证向下兼容
+        try {
+            api.hookMethod(listener, "onPrimaryClipChanged", new Class<?>[0], regionAround);
+            api.log(TAG + ": hooked ClipboardListener#onPrimaryClipChanged");
+        } catch (Throwable t) {
+            logFailure("hook ClipboardListener#onPrimaryClipChanged", t);
+        }
+
+        // ColorOS 15 的 onPrimaryClipChanged() 中调用 shouldSuppressOverlay
+        // 当用户在模块设置中关闭剪贴板功能时，让 shouldSuppressOverlay 返回 true，抑制弹窗
+        try {
+            api.hookAllMethods(listener, "shouldSuppressOverlay", new HookApi.Around() {
+                @Override
+                public void before(Object thisObject, Object[] args) {
+                }
+
+                @Override
+                public Object after(Object thisObject, Object[] args, Object result) {
+                    if (!clipboardEnabled) {
+                        return Boolean.TRUE;
+                    }
+                    return result;
+                }
+            });
+            api.log(TAG + ": hooked ClipboardListener#shouldSuppressOverlay");
+        } catch (Throwable t) {
+            logFailure("hook ClipboardListener#shouldSuppressOverlay", t);
+        }
+    }
+
+    private static void updateClipboardListenerState() {
+        Object listener = clipboardListenerInstance;
+        if (listener == null) {
+            return;
+        }
+        try {
+            Field fMgr = null;
+            for (Class<?> c = listener.getClass(); c != null; c = c.getSuperclass()) {
+                try {
+                    fMgr = c.getDeclaredField("mClipboardManager");
+                    fMgr.setAccessible(true);
+                    break;
+                } catch (NoSuchFieldException ignored) {
+                }
+            }
+            if (fMgr == null) {
+                return;
+            }
+            Object mgr = fMgr.get(listener);
+            if (mgr == null) {
+                return;
+            }
+            if (clipboardEnabled && !clipboardListenerRegistered) {
+                Method add = mgr.getClass().getMethod("addPrimaryClipChangedListener",
+                        android.content.ClipboardManager.OnPrimaryClipChangedListener.class);
+                add.invoke(mgr, listener);
+                clipboardListenerRegistered = true;
+                api.log(TAG + ": dynamic registered clipboard listener");
+            } else if (!clipboardEnabled && clipboardListenerRegistered) {
+                Method remove = mgr.getClass().getMethod("removePrimaryClipChangedListener",
+                        android.content.ClipboardManager.OnPrimaryClipChangedListener.class);
+                remove.invoke(mgr, listener);
+                clipboardListenerRegistered = false;
+                api.log(TAG + ": dynamic unregistered clipboard listener");
+            }
+        } catch (Throwable t) {
+            logFailure("updateClipboardListenerState", t);
+        }
     }
 
     /** 两个功能各自在自己那段代码里让 isExpRegion() 返回 true，其余调用点不受影响。 */
